@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <thread>
 #include "steam/steamnetworkingsockets.h"
 #include "SteamInterface.hpp"
 #include "SynchronizedClock.hpp"
@@ -58,6 +59,8 @@ namespace TiltedPhoques
 
     private:
 
+        void AssertOwnerThread() const noexcept;
+
         static void SteamNetConnectionStatusChangedCallback(SteamNetConnectionStatusChangedCallback_t* apInfo);
         static void UVGetAddrInfoCallback(void* apHandle, int aStatus, void* apResult);
         void OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t* apInfo);
@@ -74,5 +77,7 @@ namespace TiltedPhoques
         Statistics m_previousFrame{};
         void* m_pLoop{};
         void* m_pHandle{};
+        mutable std::thread::id m_ownerThread{};
+        bool m_shuttingDown{};
     };
 }

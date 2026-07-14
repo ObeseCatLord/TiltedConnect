@@ -29,8 +29,34 @@ namespace TiltedPhoques
 
     Client::~Client()
     {
-        uv_loop_close(static_cast<uv_loop_t*>(m_pLoop));
-        Allocator::Get()->Free(m_pLoop);
+        m_shuttingDown = true;
+        if (m_connection != k_HSteamNetConnection_Invalid)
+        {
+            m_pInterface->CloseConnection(m_connection, 0, nullptr, false);
+            m_connection = k_HSteamNetConnection_Invalid;
+        }
+
+        auto* pLoop = static_cast<uv_loop_t*>(m_pLoop);
+        if (!pLoop)
+        {
+            SteamInterface::Release();
+            return;
+        }
+
+        if (m_pHandle != nullptr)
+            uv_cancel(static_cast<uv_req_t*>(m_pHandle));
+
+        for (uint32_t attempt = 0; attempt < 250 && uv_loop_alive(pLoop); ++attempt)
+        {
+            uv_run(pLoop, UV_RUN_NOWAIT);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        // A still-busy loop may be owned by an uncancellable resolver worker.
+        // Leaking it at process teardown is safer than freeing live libuv state.
+        if (uv_loop_close(pLoop) == 0)
+            Allocator::Get()->Free(m_pLoop);
+        m_pLoop = nullptr;
         SteamInterface::Release();
     }
 
@@ -47,6 +73,8 @@ namespace TiltedPhoques
     {
         std::swap(m_connection, aRhs.m_connection);
         std::swap(m_pInterface, aRhs.m_pInterface);
+        std::swap(m_ownerThread, aRhs.m_ownerThread);
+        std::swap(m_shuttingDown, aRhs.m_shuttingDown);
 
         return *this;
     }
@@ -64,6 +92,7 @@ namespace TiltedPhoques
 
     bool Client::Connect(const std::string& acEndpoint) noexcept
     {
+        AssertOwnerThread();
         static auto GetAddrInfoCallback = [](uv_getaddrinfo_t* apHandle, int aStatus, struct addrinfo* apResult)
         {
             SteamNetworkingIPAddr remoteAddress{};
@@ -93,6 +122,9 @@ namespace TiltedPhoques
 
             uv_freeaddrinfo(apResult);
             Allocator::GetDefault()->Free(apHandle);
+
+            if (pClient->m_shuttingDown)
+                return;
 
             if(aStatus == UV_ECANCELED)
             {
@@ -132,6 +164,7 @@ namespace TiltedPhoques
 
     bool Client::Connect(const SteamNetworkingIPAddr& acEndpoint) noexcept
     {
+        AssertOwnerThread();
         SteamNetworkingConfigValue_t opt = {};
         opt.SetPtr(k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged, reinterpret_cast<void*>(&SteamNetConnectionStatusChangedCallback));
         m_connection = m_pInterface->ConnectByIPAddress(acEndpoint, 1, &opt);
@@ -141,6 +174,7 @@ namespace TiltedPhoques
 
     bool Client::ConnectByIp(const std::string& acEndpoint) noexcept
     {
+        AssertOwnerThread();
         SteamNetworkingIPAddr remoteAddress{};
         remoteAddress.ParseString(acEndpoint.c_str());
 
@@ -149,6 +183,7 @@ namespace TiltedPhoques
 
     void Client::Close() noexcept
     {
+        AssertOwnerThread();
         if (m_connection != k_HSteamNetConnection_Invalid)
         {
             m_pInterface->CloseConnection(m_connection, 0, nullptr, true);
@@ -167,6 +202,7 @@ namespace TiltedPhoques
 
     void Client::Update() noexcept
     {
+        AssertOwnerThread();
         m_clock.Update();
 
         if (m_clock.GetCurrentTick() - m_lastStatisticsPoint >= 1000)
@@ -204,6 +240,7 @@ namespace TiltedPhoques
 
     void Client::Send(Packet* apPacket, const EPacketFlags acPacketFlags) const noexcept
     {
+        AssertOwnerThread();
         m_currentFrame.UncompressedSentBytes += apPacket->m_size;
 
         if (apPacket->m_pData[0] == kPayload)
@@ -262,6 +299,15 @@ namespace TiltedPhoques
     const SynchronizedClock& Client::GetClock() const noexcept
     {
         return m_clock;
+    }
+
+    void Client::AssertOwnerThread() const noexcept
+    {
+        const auto currentThread = std::this_thread::get_id();
+        if (m_ownerThread == std::thread::id{})
+            m_ownerThread = currentThread;
+
+        assert(m_ownerThread == currentThread && "TiltedConnect::Client used from multiple owner threads");
     }
 
     void Client::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t* apInfo)
