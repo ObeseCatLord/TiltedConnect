@@ -1,5 +1,6 @@
 #include <chrono>
 #include "Client.hpp"
+#include "ClientAttemptPolicy.hpp"
 #include "SteamInterface.hpp"
 #include <steam/isteamnetworkingutils.h>
 #include <cassert>
@@ -30,6 +31,7 @@ namespace TiltedPhoques
     Client::~Client()
     {
         m_shuttingDown = true;
+        ++m_resolveGeneration;
         if (m_connection != k_HSteamNetConnection_Invalid)
         {
             m_pInterface->CloseConnection(m_connection, 0, nullptr, false);
@@ -93,13 +95,24 @@ namespace TiltedPhoques
     bool Client::Connect(const std::string& acEndpoint) noexcept
     {
         AssertOwnerThread();
+        if (!ClientAttemptPolicy::CanStartConnection(
+                m_connection, k_HSteamNetConnection_Invalid))
+            return false;
         static auto GetAddrInfoCallback = [](uv_getaddrinfo_t* apHandle, int aStatus, struct addrinfo* apResult)
         {
             SteamNetworkingIPAddr remoteAddress{};
             bool valid = false;
 
             auto* pClient = static_cast<Client*>(apHandle->loop->data);
-            pClient->m_pHandle = nullptr;
+            const auto requestGeneration = static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(apHandle->data));
+            const bool isCurrentRequest = pClient && ClientAttemptPolicy::IsCurrentResolveRequest(
+                pClient->m_shuttingDown,
+                pClient->m_pHandle == apHandle,
+                requestGeneration,
+                pClient->m_resolveGeneration);
+            if (isCurrentRequest)
+                pClient->m_pHandle = nullptr;
             
             if (aStatus == 0)
             {
@@ -120,10 +133,14 @@ namespace TiltedPhoques
                 }
             }
 
-            uv_freeaddrinfo(apResult);
+            if (apResult)
+                uv_freeaddrinfo(apResult);
             Allocator::GetDefault()->Free(apHandle);
 
-            if (pClient->m_shuttingDown)
+            // uv_cancel cannot stop every resolver worker. A completion from a
+            // retired request must never clear a replacement request or open
+            // a socket for the retired endpoint.
+            if (!isCurrentRequest)
                 return;
 
             if(aStatus == UV_ECANCELED)
@@ -145,6 +162,17 @@ namespace TiltedPhoques
             }
         };
 
+        if (m_pHandle != nullptr)
+        {
+            auto* pPreviousHandle = static_cast<uv_getaddrinfo_t*>(m_pHandle);
+            m_pHandle = nullptr;
+            uv_cancel(reinterpret_cast<uv_req_t*>(pPreviousHandle));
+        }
+
+        auto resolveGeneration = ++m_resolveGeneration;
+        if (resolveGeneration == 0)
+            resolveGeneration = ++m_resolveGeneration;
+
         const auto pos = acEndpoint.find_last_of(':');
         auto* pHandle = static_cast<uv_getaddrinfo_t*>(Allocator::GetDefault()->Allocate(sizeof(uv_getaddrinfo_t)));
 
@@ -156,8 +184,18 @@ namespace TiltedPhoques
             endpoint = endpoint.substr(0, pos);
         }
 
+        pHandle->data = reinterpret_cast<void*>(static_cast<uintptr_t>(resolveGeneration));
         m_pHandle = pHandle;
-        uv_getaddrinfo(static_cast<uv_loop_t*>(m_pLoop), pHandle, GetAddrInfoCallback, endpoint.c_str(), serviceName.c_str(), nullptr);
+        const auto resolveResult = uv_getaddrinfo(
+            static_cast<uv_loop_t*>(m_pLoop), pHandle, GetAddrInfoCallback,
+            endpoint.c_str(), serviceName.c_str(), nullptr);
+        if (resolveResult != 0)
+        {
+            m_pHandle = nullptr;
+            Allocator::GetDefault()->Free(pHandle);
+            OnDisconnected(kCannotResolve);
+            return false;
+        }
 
         return true;
     }
@@ -165,6 +203,19 @@ namespace TiltedPhoques
     bool Client::Connect(const SteamNetworkingIPAddr& acEndpoint) noexcept
     {
         AssertOwnerThread();
+        if (!ClientAttemptPolicy::CanStartConnection(
+                m_connection, k_HSteamNetConnection_Invalid))
+            return false;
+        // A direct-IP attempt is also a resolver boundary. Without this, an
+        // older hostname lookup can complete later and overwrite the socket
+        // even though the caller has already selected another endpoint.
+        if (m_pHandle != nullptr)
+        {
+            auto* pPreviousHandle = static_cast<uv_getaddrinfo_t*>(m_pHandle);
+            m_pHandle = nullptr;
+            ++m_resolveGeneration;
+            uv_cancel(reinterpret_cast<uv_req_t*>(pPreviousHandle));
+        }
         SteamNetworkingConfigValue_t opt = {};
         opt.SetPtr(k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged, reinterpret_cast<void*>(&SteamNetConnectionStatusChangedCallback));
         m_connection = m_pInterface->ConnectByIPAddress(acEndpoint, 1, &opt);
@@ -184,6 +235,7 @@ namespace TiltedPhoques
     void Client::Close() noexcept
     {
         AssertOwnerThread();
+        bool notified = false;
         if (m_connection != k_HSteamNetConnection_Invalid)
         {
             m_pInterface->CloseConnection(m_connection, 0, nullptr, true);
@@ -192,11 +244,17 @@ namespace TiltedPhoques
             m_clock.Reset();
 
             OnDisconnected(kAborted);
+            notified = true;
         }
 
         if(m_pHandle != nullptr)
         {
-            uv_cancel(static_cast<uv_req_t*>(m_pHandle));
+            auto* pHandle = static_cast<uv_req_t*>(m_pHandle);
+            m_pHandle = nullptr;
+            ++m_resolveGeneration;
+            uv_cancel(pHandle);
+            if (!notified)
+                OnDisconnected(kAborted);
         }
     }
 
@@ -312,6 +370,13 @@ namespace TiltedPhoques
 
     void Client::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t* apInfo)
     {
+        // Steam may deliver a queued terminal callback after a replacement
+        // connection has already become current. Never let the retired handle
+        // close or reset the replacement attempt.
+        if (!apInfo || !ClientAttemptPolicy::IsCurrentConnectionCallback(
+                apInfo->m_hConn, m_connection, k_HSteamNetConnection_Invalid))
+            return;
+
         switch (apInfo->m_info.m_eState)
         {
         case k_ESteamNetworkingConnectionState_None:

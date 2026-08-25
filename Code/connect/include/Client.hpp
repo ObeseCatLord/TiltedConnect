@@ -77,6 +77,7 @@ namespace TiltedPhoques
         Statistics m_previousFrame{};
         void* m_pLoop{};
         void* m_pHandle{};
+        uint64_t m_resolveGeneration{};
         mutable std::thread::id m_ownerThread{};
         bool m_shuttingDown{};
     };
